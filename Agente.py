@@ -138,6 +138,7 @@ def ejecutar_auditoria_gemini(data_informe: Dict[str, Any], reglas_notion: List[
     for r in reglas_notion:
         contexto_reglas += f"- Evento: {r['evento']} | Cubierto: {r['cubierto']} | Exclusiones: {r['exclusiones']} | Requisitos: {r['requisitos']}\n"
 
+    # ¡AQUÍ ESTÁ EL CAMBIO! Agregamos la línea "- Documentos Anexados:"
     prompt_solicitud = f"""
     Eres un auditor médico experto para "Aseguradora del Sur" encargado de evaluar pre-autorizaciones quirúrgicas bajo la póliza de Accidentes Personales.
     Tu misión es analizar el informe del hospital y contrastarlo contra las reglas de la compañía.
@@ -148,11 +149,13 @@ def ejecutar_auditoria_gemini(data_informe: Dict[str, Any], reglas_notion: List[
     DATOS CLÍNICOS ACTUALES DEL PACIENTE (INFORME DEL HOSPITAL):
     - Diagnóstico Clínico: {data_informe.get('Diagnostico_Clinico')}
     - Procedimiento Solicitado: {data_informe.get('Procedimiento_Solicitado')}
+    - Documentos Anexados: {data_informe.get('Documentos_Anexos', 'No se enviaron documentos')}
 
     TAREA ANALÍTICA:
     1. Define el Nexo Causal: ¿La lesión descrita fue producida por una acción fortuita, repentina, violenta y de fuerza exterior (Accidente) o es una Enfermedad Común/Patología Crónica?
     2. Cruza el diagnóstico contra las exclusiones críticas (Las hernias, lumbalgias, várices y trasplantes están prohibidos por el Art. 3 del contrato).
     3. Evalúa si el diagnóstico médico del hospital se asocia semánticamente a alguna regla cubierta (ej. colisión vehicular mapea con Accidente de Tránsito).
+    4. Verifica estrictamente que los "Documentos Anexados" cumplan con los requisitos de la regla. Si faltan, tu decisión debe ser "Faltan documentos".
 
     RESPUESTA REQUERIDA (FORMATO JSON ESTRICTO):
     {{
@@ -174,7 +177,7 @@ def ejecutar_auditoria_gemini(data_informe: Dict[str, Any], reglas_notion: List[
         }
     except Exception as e:
         return {"decision": "Faltan documentos", "razones": f"Error en la IA: {str(e)}"}
-
+    
 # ==============================================================================
 # 5. PIPELINE INTEGRADO
 # ==============================================================================
