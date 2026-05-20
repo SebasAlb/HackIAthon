@@ -10,3 +10,4 @@ pypdf
 pyyaml
 google-labs-html-chunker
 python-dotenv
+google.adk
