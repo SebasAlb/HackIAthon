@@ -4,3 +4,4 @@ openpyxl
 notion-client
 google-genai
 dotenv
+pytesseract
