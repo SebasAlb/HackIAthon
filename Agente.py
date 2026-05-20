@@ -16,9 +16,9 @@ import yaml
 
 from notion_client import AsyncClient
 from notion_client.errors import APIResponseError, RequestTimeoutError
-import google.generativeai as genai
-from google.generativeai import types
-from google.generativeai.types import Content, Part
+from google import genai
+from google.genai import types
+from google.genai.types import Content, Part
 
 # Importaciones del framework Google ADK para gestión del agente autónomo
 from google.adk.agents.llm_agent import Agent
@@ -44,15 +44,15 @@ if not NOTION_API_KEY or not GOOGLE_API_KEY:
 
 # Inicialización de clientes (Notion y Google Gemini)
 notion = AsyncClient(auth=NOTION_API_KEY, notion_version="2025-09-03")
-genai.configure(api_key=GOOGLE_API_KEY)
 
 # Funciones auxiliares para la construcción de propiedades de Notion
 def _title(text: Optional[str]) -> Dict[str, Any]: 
     return {"title": [{"type": "text", "text": {"content": text or ""}}]}
 
-def _rich_text(text: Optional[str]) -> Dict[str, Any]:
+def _rich_text(text: Any) -> Dict[str, Any]:
     if not text: return {"rich_text": []}
-    return {"rich_text": [{"type": "text", "text": {"content": text[:1900]}}]}
+    text_str = str(text) if not isinstance(text, list) else " ".join(str(i) for i in text)
+    return {"rich_text": [{"type": "text", "text": {"content": text_str[:1900]}}]}
 
 def _date(start: Optional[str], end: Optional[str] = None) -> Dict[str, Any]:
     if not start: return {"date": None}
@@ -151,12 +151,21 @@ async def fetch_notion_rules() -> List[Dict[str, Any]]:
         resp = await notion_retry(lambda: notion.data_sources.query(data_source_id=ds_id, start_cursor=cursor))
         for page in resp["results"]:
             p = page["properties"]
-            procedimiento = p.get("Procedimiento", {}).get("title", [{}])[0].get("plain_text") if p.get("Procedimiento", {}).get("title") else None
-            cubierto = p.get("Cubierto", {}).get("select", {}).get("name") if p.get("Cubierto", {}).get("select") else None
-            carencia = p.get("Carencia (días)", {}).get("number")
-            exclusiones = "".join(t["plain_text"] for t in p.get("Exclusiones", {}).get("rich_text", [])) or None
-            requisitos = [t["name"] for t in p.get("Requisitos documentales", {}).get("multi_select", [])]
-            rules.append({"procedimiento": procedimiento, "cubierto": cubierto, "carencia_dias": carencia, "exclusiones": exclusiones, "requisitos": requisitos})
+            title_arr = p.get("Evento / Diagnóstico Traumático", {}).get("title", [])
+            evento = title_arr[0]["plain_text"] if title_arr else None
+            sel = p.get("Cubierto", {}).get("select")
+            cubierto = sel["name"] if sel else None
+            excl_arr = p.get("Exclusiones Semánticas Críticas", {}).get("rich_text", [])
+            exclusiones = "".join(t["plain_text"] for t in excl_arr) or None
+            req_arr = p.get("Requisitos Documentales Exigidos", {}).get("multi_select", [])
+            requisitos = [t["name"] for t in req_arr]
+
+            rules.append({
+                "evento": evento,
+                "cubierto": cubierto,
+                "exclusiones": exclusiones,
+                "requisitos": requisitos
+            })
         if not resp["has_more"]: break
         cursor = resp["next_cursor"]
     return rules
@@ -165,8 +174,7 @@ async def fetch_notion_rules() -> List[Dict[str, Any]]:
 async def add_notion_case(caso: str, paciente: Optional[str] = None, procedimiento: Optional[str] = None, aseguradora_plan: Optional[str] = None, decision: str = "Pendiente", razones: Optional[str] = None, texto_extraido: Optional[str] = None) -> Optional[str]:
     properties = {
         "Caso": _title(caso), "Paciente": _rich_text(paciente), "Procedimiento solicitado": _rich_text(procedimiento),
-        "Aseguradora / Plan": _rich_text(aseguradora_plan), "Decisión": _status(decision), 
-        "Razones (resumen)": _rich_text(razones), "Texto extraído (fallback)": _rich_text(texto_extraido)
+        "Decisión": _status(decision), "Razones (resumen)": _rich_text(razones), "Texto extraído (fallback)": _rich_text(texto_extraido)
     }
     try:
         page = await notion_retry(lambda: notion.pages.create(parent={"database_id": NOTION_CASES_DB_ID}, properties=properties))
@@ -186,39 +194,77 @@ def evaluar_reglas_duras(datos_inf: Dict, datos_pol: Dict) -> Optional[Dict[str,
     id_hosp = str(datos_inf.get("Paciente_Identificacion", "")).strip()
     id_pol = str(datos_pol.get("Titular_Identificacion", "")).strip()
     
-    if id_hosp and id_pol and id_hosp != id_pol:
-        return {"decision": "No cubierto", "razones": "Rechazo de Seguridad: La identidad del paciente no coincide con el titular."}
+    if not id_hosp or not id_pol or id_hosp != id_pol:
+        return {"decision": "No cubierto", "razones": "RECHAZO CRÍTICO DE SEGURIDAD: La cédula del paciente del hospital no coincide con el dueño registrado de la póliza (Posible fraude o falta de datos)."}
     
     try: edad = int(float(datos_inf.get("Paciente_Edad", 0)))
     except (ValueError, TypeError): edad = -1
     
-    if 0 <= edad < 3 or edad > 65:
-        return {"decision": "No cubierto", "razones": "Rechazo Contractual: Edad del paciente fuera del rango admitido (3-65 años)."}
+    if edad < 0 or edad > 65:
+        return {"decision": "No cubierto", "razones": "Rechazado por Artículo 11: Fuera del rango estipulado (3 a 65 años)."}
     
     f_acc = datos_inf.get("Fecha_Accidente")
-    f_adm = datos_inf.get("Fecha_Admision")
-    if _dias_entre(f_acc, f_adm) and _dias_entre(f_acc, f_adm) > 30:
-        return {"decision": "No cubierto", "razones": "Rechazo Contractual: Notificación extemporánea del evento (mayor a 30 días)."}
+    f_not = datos_inf.get("Fecha_Admision")
+    f_cir = datos_inf.get("Fecha_Admision")
+    
+    if _dias_entre(f_acc, f_not) and _dias_entre(f_acc, f_not) > 30:
+        return {"decision": "No cubierto", "razones": "Rechazado por Artículo 14: Reporte extemporáneo (> 30 días)."}
+    elif _dias_entre(f_acc, f_cir) and _dias_entre(f_acc, f_cir) > 180:
+        return {"decision": "No cubierto", "razones": "Rechazado por Parte IV: Fuera del límite de cobertura (180 días)."}
     
     estado_prima = _norm(str(datos_pol.get("Estado_Prima", "")))
-    if estado_prima and "pagado" not in estado_prima and "al dia" not in estado_prima:
-        return {"decision": "No cubierto", "razones": "Rechazo Administrativo: Contrato suspendido por falta de pago."}
+    if "pagado" not in estado_prima and "al dia" not in estado_prima:
+        return {"decision": "No cubierto", "razones": "Rechazado por Artículo 10: Póliza inactiva por mora de pago."}
     
     return None
 
 # Motor de evaluación: Inferencia semántica y análisis causal utilizando Gemini
 def auditoria_gemini(datos: Dict, reglas: List[Dict]) -> Dict[str, str]:
     client = genai.Client()
-    contexto = "\n".join([f"Regla: {r['procedimiento']} | Cobertura: {r['cubierto']} | Exclusiones: {r['exclusiones']}" for r in reglas])
-    prompt = f"Eres un auditor. Evalúa el caso. REGLAS:\n{contexto}\nDATOS: Diag: {datos.get('Diagnostico_Clinico')} | Proc: {datos.get('Procedimiento_Solicitado')}. Responde en JSON con 'decision' y 'razones'."
-    
+    contexto_reglas = ""
+    for r in reglas:
+        contexto_reglas += f"- Evento: {r['evento']} | Cubierto: {r['cubierto']} | Exclusiones: {r['exclusiones']} | Requisitos: {r['requisitos']}\n"
+
+    prompt_solicitud = f"""
+Eres un auditor médico experto para "Aseguradora del Sur" encargado de evaluar pre-autorizaciones quirúrgicas bajo la póliza de Accidentes Personales.
+Tu misión es analizar el informe del hospital y contrastarlo contra las reglas de la compañía.
+
+REGLAS DE COBERTURA CONFIGURADAS (NOTION MAESTRO):
+{contexto_reglas}
+
+DATOS CLÍNICOS ACTUALES DEL PACIENTE (INFORME DEL HOSPITAL):
+- Diagnóstico Clínico: {datos.get('Diagnostico_Clinico')}
+- Procedimiento Solicitado: {datos.get('Procedimiento_Solicitado')}
+- Documentos Anexados: {datos.get('Documentos_Anexos', 'No se enviaron documentos')}
+
+TAREA ANALÍTICA:
+1. Define el Nexo Causal: ¿La lesión descrita fue producida por una acción fortuita, repentina, violenta y de fuerza exterior (Accidente) o es una Enfermedad Común/Patología Crónica?
+2. Cruza el diagnóstico contra las exclusiones críticas (Las hernias, lumbalgias, várices y trasplantes están prohibidos por el Art. 3 del contrato).
+3. Evalúa si el diagnóstico médico del hospital se asocia semánticamente a alguna regla cubierta (ej. colisión vehicular mapea con Accidente de Tránsito).
+4. Verifica estrictamente que los "Documentos Anexados" cumplan con los requisitos de la regla. Si faltan, tu decisión debe ser "Faltan documentos".
+
+RESPUESTA REQUERIDA (FORMATO JSON ESTRICTO):
+{{
+"decision": "Preaprobado", "No cubierto", o "Faltan documentos",
+"razones": "Explicación detallada (Máx 350 caracteres)."
+}}
+"""
     try:
-        resp = client.models.generate_content(
-            model='gemini-2.5-flash', 
-            contents=prompt, 
+        response = client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=prompt_solicitud,
             config=types.GenerateContentConfig(response_mime_type="application/json", temperature=0.1)
         )
-        return json.loads(resp.text.strip())
+        resultado_ia = json.loads(response.text.strip())
+        
+        # Validación de tipo de dato para evitar listas en la UI
+        if isinstance(resultado_ia.get("razones"), list):
+            resultado_ia["razones"] = " ".join(str(r) for r in resultado_ia["razones"])
+            
+        return {
+            "decision": resultado_ia.get("decision", "Pendiente"),
+            "razones": resultado_ia.get("razones", "Evaluación completada.")
+        }
     except Exception as e:
         return {"decision": "Pendiente", "razones": f"Error de evaluación semántica: {e}"}
 
@@ -243,6 +289,9 @@ async def process_new_case_request(caso: str, paciente: str, aseguradora_plan: s
     if not page_id:
         page_id = await add_notion_case(caso=caso, paciente=paciente, aseguradora_plan=aseguradora_plan, procedimiento=procedimiento)
     
+    if not page_id:
+        return "Error crítico: No se pudo crear el caso en Notion. Verifica que las propiedades existan en tu base de datos."
+    
     # Flujo secuencial de validaciones
     decision_final = None
     
@@ -256,10 +305,14 @@ async def process_new_case_request(caso: str, paciente: str, aseguradora_plan: s
         else:
             decision_final = {"decision": "Pendiente", "razones": "Revisión manual o por agente avanzado requerida. Documentos no estructurados."}
 
-    # Registro de la decisión computada
+    # Registro y validación estricta de la decisión computada para compatibilidad con Notion
+    decision_estado = str(decision_final.get("decision", "Pendiente"))
+    if decision_estado not in DECISIONES_VALIDAS:
+        decision_estado = "Pendiente"
+
     properties = {
-        "Decisión": _status(decision_final["decision"]),
-        "Razones (resumen)": _rich_text(decision_final["razones"]),
+        "Decisión": _status(decision_estado),
+        "Razones (resumen)": _rich_text(decision_final.get("razones", "")),
         "Texto extraído (fallback)": _rich_text(texto_extraido)
     }
     await notion_retry(lambda: notion.pages.update(page_id=page_id, properties=properties))
@@ -268,21 +321,20 @@ async def process_new_case_request(caso: str, paciente: str, aseguradora_plan: s
 
 # Definición del entorno y orquestación del agente ADK
 config_yaml = """
-name: Agente_Pre_Autorizacion
+name: Agente_Asistente_Informativo
 model: gemini-2.5-flash
-description: Agente para procesar pre-autorizaciones quirúrgicas.
+description: Asistente cordial para brindar información sobre el sistema de auditoría.
 instruction: |
-  Eres un agente estricto y profesional encargado de auditoría médica.
-  1. Solicita titulo del caso, paciente, aseguradora y procedimiento.
-  2. Utiliza process_new_case_request para el registro en el sistema core.
-  3. Proporciona respuestas concisas y directas. No utilices emojis ni lenguaje coloquial.
+  Eres un asistente virtual muy cordial, amable y servicial para la plataforma de Auditoría Médica de la Aseguradora del Sur.
+  Tu ÚNICA función es resolver dudas del usuario sobre cómo funciona el sistema automático de auditoría, qué reglas aplican o cómo subir los documentos.
+  Bajo ninguna circunstancia intentes procesar un caso, registrar información ni ejecutar acciones, ya que tu rol es puramente informativo.
+  Saluda con calidez y ofrece tu ayuda con mucha cortesía.
 """
 config = yaml.safe_load(config_yaml)
-pre_auth_tool = FunctionTool(func=process_new_case_request)
 
 root_agent = Agent(
     model=config["model"], name=config["name"], description=config["description"],
-    instruction=config["instruction"], tools=[pre_auth_tool]
+    instruction=config["instruction"]
 )
 
 session_service = InMemorySessionService()
@@ -334,18 +386,6 @@ async def submit_case_automatico(file_hosp, file_seg):
     )
     return f"Expediente Ticket: {titulo}\n{resultado}"
 
-# Función adaptadora para el flujo asistido con captura explícita
-async def submit_case_ui(paciente, aseguradora, procedimiento, file_hosp, file_seg):
-    if not paciente or not aseguradora or not procedimiento:
-        return "Error: Faltan campos obligatorios en el formulario de registro."
-    
-    titulo = f"C-{int(datetime.now().timestamp()) % 1000:03d} — {procedimiento[:15]} — {paciente.split()[-1]}"
-    resultado = await process_new_case_request(
-        caso=titulo, paciente=paciente, aseguradora_plan=aseguradora, procedimiento=procedimiento,
-        informe_path=_save_upload(file_hosp), poliza_path=_save_upload(file_seg)
-    )
-    return resultado
-
 # Puente conversacional entre la interfaz gráfica y el agente ADK
 async def chat_wrapper(message, history):
     try:
@@ -354,14 +394,18 @@ async def chat_wrapper(message, history):
         # Fallback en caso de incompatibilidad con versiones del SDK de genai
         msg = {"role": "user", "parts": [{"text": message}]}
         
+    sesion_actual = await session_service.get_session(app_name="preauth", user_id="user_admin", session_id="sesion_1")
+    if not sesion_actual:
+        await session_service.create_session(app_name="preauth", user_id="user_admin", session_id="sesion_1")
+
     full = ""
     async for ev in runner.run_async(new_message=msg, user_id="user_admin", session_id="sesion_1"):
         if ev.is_final_response() and ev.content and hasattr(ev.content, 'parts') and ev.content.parts:
             full = ev.content.parts[0].text
     return full or "Evaluación en curso (Sin respuesta textual del agente)."
 
-with gr.Blocks(title="Consola de Auditoría AI", theme=gr.themes.Soft(primary_hue="blue", neutral_hue="slate")) as demo:
-    gr.Markdown("# Sistema Central de Auditoría Automatizada\n### Cruce de Identidad, Filtros de Tiempo y Análisis Documental Integral")
+with gr.Blocks(title="Consola de Auditoría AI") as demo:
+    gr.Markdown("# Sistema Central de Auditoría Automatizada")
     
     with gr.Tabs():
         # Pestaña Principal (Enfoque en subida de archivos sin formularios)
@@ -378,20 +422,7 @@ with gr.Blocks(title="Consola de Auditoría AI", theme=gr.themes.Soft(primary_hu
                     out_auto = gr.Textbox(label="Resultados y Logs en Tiempo Real (Notion Connected)", lines=12, interactive=False)
             btn_auto.click(fn=submit_case_automatico, inputs=[file_hospital_auto, file_aseguradora_auto], outputs=out_auto)
 
-        # Pestañas Secundarias (Formulario Asistido y Chat)
-        with gr.Tab("Formulario de Carga Manual", id=2):
-            gr.Markdown("### Registro Estructurado de Siniestros y Anexos")
-            with gr.Row():
-                with gr.Column():
-                    paciente_in = gr.Textbox(label="Nombre del Paciente")
-                    aseguradora_in = gr.Textbox(label="Aseguradora / Plan")
-                    procedimiento_in = gr.Textbox(label="Procedimiento Solicitado")
-                    file_hosp_manual = gr.File(label="Documentos de Soporte Médico (Opcional)", type="filepath")
-                    file_seg_manual = gr.File(label="Documentos de Contrato (Opcional)", type="filepath")
-                    btn_manual = gr.Button("Validar y Procesar Formulario")
-                with gr.Column():
-                    out_manual = gr.Textbox(label="Resultado de la Evaluación", lines=10, interactive=False)
-            btn_manual.click(fn=submit_case_ui, inputs=[paciente_in, aseguradora_in, procedimiento_in, file_hosp_manual, file_seg_manual], outputs=out_manual)
+        # Pestañas Secundarias (Asistente Chat)
 
         with gr.Tab("Asistente Conversacional ADK", id=3):
             gr.Markdown("### Interfaz de Consulta Dinámica con Agente Cognitivo")
@@ -403,5 +434,6 @@ if __name__ == "__main__":
         server_name="0.0.0.0", 
         server_port=puerto,
         quiet=True, 
-        share=False
+        share=False,
+        theme=gr.themes.Soft(primary_hue="blue", neutral_hue="slate")
     )
