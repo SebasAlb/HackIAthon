@@ -5,3 +5,8 @@ notion-client
 google-genai
 dotenv
 pytesseract
+Pillow
+pypdf
+pyyaml
+google-labs-html-chunker
+python-dotenv
