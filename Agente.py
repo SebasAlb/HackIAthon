@@ -268,8 +268,8 @@ with gr.Blocks(title="Consola de Auditoría AI") as front_app:
         with gr.Column(scale=1):
             gr.Markdown("### 📥 Carga de Archivos Individuales del Siniestro")
             # Ampliamos los tipos de archivo para que te acepte tus CSVs sin problema
-            file_hospital = gr.File(label="1. Formato del Hospital", file_types=[".xlsx", ".xls", ".csv"])
-            file_aseguradora = gr.File(label="2. Formato de Aseguradora", file_types=[".xlsx", ".xls", ".csv"])
+            file_hospital = gr.File(label="1. Formato del Hospital", file_types=[".xlsx", ".xls", ".csv"], type="filepath")
+            file_aseguradora = gr.File(label="2. Formato de Aseguradora", file_types=[".xlsx", ".xls", ".csv"], type="filepath")
             btn_run = gr.Button("⚡ AUDITAR EXPEDIENTE Y SINCRONIZAR", variant="primary")
             
         with gr.Column(scale=1):
