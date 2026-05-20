@@ -279,4 +279,13 @@ with gr.Blocks(title="Consola de Auditoría AI") as front_app:
     btn_run.click(fn=procesar_siniestro_pipeline, inputs=[file_hospital, file_aseguradora], outputs=consola_logs)
 
 if __name__ == "__main__":
-    front_app.launch(quiet=True, share=False, theme=gr.themes.Soft(primary_hue="blue", neutral_hue="slate"))
+    # Extraer el puerto dinámico que asigna la nube (o usar 7860 de fallback en local)
+    puerto = int(os.environ.get("PORT", 7860))
+    
+    front_app.launch(
+        server_name="0.0.0.0",  # <- CRÍTICO PARA NUBE: Permite tráfico externo
+        server_port=puerto,      # <- CRÍTICO PARA RAILWAY: Puerto dinámico
+        quiet=True, 
+        share=False, 
+        theme=gr.themes.Soft(primary_hue="blue", neutral_hue="slate")
+    )
