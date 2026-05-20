@@ -11,6 +11,7 @@ from notion_client.errors import APIResponseError, RequestTimeoutError
 from google import genai
 from google.genai import types
 from dotenv import load_dotenv
+import traceback
 
 # ==============================================================================
 # 1. CONFIGURACIÓN DE CREDENCIALES Y BASES DE DATOS DE NOTION
@@ -177,37 +178,52 @@ def ejecutar_auditoria_gemini(data_informe: Dict[str, Any], reglas_notion: List[
 # ==============================================================================
 # 5. PIPELINE INTEGRADO
 # ==============================================================================
+ # Añade esto arriba junto a tus otros imports si no lo tienes
+
+# ==============================================================================
+# 5. PIPELINE INTEGRADO (CORREGIDO Y OPTIMIZADO PARA NUBE)
+# ==============================================================================
 async def procesar_siniestro_pipeline(archivo_informe, archivo_poliza) -> str:
     if not archivo_informe or not archivo_poliza:
         return "❌ Error: Carga suspendida. Debes arrastrar Informe Médico y Póliza."
     
     try:
-        # LECTURA INTELIGENTE (Soporte automático para archivos .xlsx y .csv)
-        if archivo_informe.name.lower().endswith('.csv'):
-            df_informe = pd.read_csv(archivo_informe.name).set_index("Celda / Campo")
+        # CORRECCIÓN 1: Manejo seguro de rutas de archivos para Gradio en la nube (Render/Railway)
+        path_informe = archivo_informe if isinstance(archivo_informe, str) else archivo_informe.name
+        path_poliza = archivo_poliza if isinstance(archivo_poliza, str) else archivo_poliza.name
+
+        # LECTURA INTELIGENTE
+        if path_informe.lower().endswith('.csv'):
+            df_informe = pd.read_csv(path_informe).set_index("Celda / Campo")
         else:
-            df_informe = pd.read_excel(archivo_informe.name).set_index("Celda / Campo")
+            df_informe = pd.read_excel(path_informe).set_index("Celda / Campo")
             
-        if archivo_poliza.name.lower().endswith('.csv'):
-            df_poliza = pd.read_csv(archivo_poliza.name).set_index("Celda / Campo")
+        if path_poliza.lower().endswith('.csv'):
+            df_poliza = pd.read_csv(path_poliza).set_index("Celda / Campo")
         else:
-            df_poliza = pd.read_excel(archivo_poliza.name).set_index("Celda / Campo")
+            df_poliza = pd.read_excel(path_poliza).set_index("Celda / Campo")
             
         data_informe = df_informe["Valor de Ejemplo"].to_dict()
         data_poliza = df_poliza["Valor de Ejemplo"].to_dict()
         
-        id_hospital = str(data_informe.get("Paciente_Identificacion")).strip()
-        id_poliza = str(data_poliza.get("Titular_Identificacion")).strip()
+        # Extracción segura de IDs previniendo valores nulos
+        id_hospital = str(data_informe.get("Paciente_Identificacion", "")).strip()
+        id_poliza = str(data_poliza.get("Titular_Identificacion", "")).strip()
         
         print(f"🕵️ Cruzando identidades... ID Hospital: {id_hospital} | ID Póliza: {id_poliza}")
         
-        if id_hospital != id_poliza:
+        if not id_hospital or not id_poliza or id_hospital != id_poliza:
             veredicto = {
                 "decision": "No cubierto",
-                "razones": "RECHAZO CRÍTICO DE SEGURIDAD: La cédula del paciente del hospital no coincide con el dueño registrado de la póliza (Posible fraude)."
+                "razones": "RECHAZO CRÍTICO DE SEGURIDAD: La cédula del paciente del hospital no coincide con el dueño registrado de la póliza (Posible fraude o falta de datos)."
             }
         else:
-            edad = int(data_informe.get("Paciente_Edad", 0))
+            # CORRECCIÓN 3: Conversión segura de la edad (evita error si el Excel tiene 28.0 o viene vacío)
+            try:
+                edad = int(float(data_informe.get("Paciente_Edad", 0)))
+            except (ValueError, TypeError):
+                edad = -1
+
             f_accidente = data_informe.get("Fecha_Accidente")
             f_notificacion = data_informe.get("Fecha_Admision")
             f_cirugia = data_informe.get("Fecha_Admision")
@@ -226,36 +242,45 @@ async def procesar_siniestro_pipeline(archivo_informe, archivo_poliza) -> str:
                 reglas_notion = await fetch_notion_rules()
                 veredicto = ejecutar_auditoria_gemini(data_informe, reglas_notion)
 
-        # --- GUARDADO EN LA BASE DE CASOS DE NOTION (Nueva Estructura) ---
+        # --- GUARDADO EN LA BASE DE CASOS DE NOTION ---
         num_ticket = int(datetime.now().timestamp()) % 1000
-        apellido_paciente = str(data_informe.get("Paciente_Nombre", "Paciente")).split()[-1]
-        titulo_siniestro = f"C-{num_ticket:03d} — {str(data_informe.get('Procedimiento_Solicitado'))[:12]} — {apellido_paciente}"
+        nombre_paciente = str(data_informe.get("Paciente_Nombre", "Paciente Anónimo"))
+        partes_nombre = nombre_paciente.split()
+        apellido_paciente = partes_nombre[-1] if len(partes_nombre) > 0 else "Paciente"
+        
+        proc_solicitado = str(data_informe.get('Procedimiento_Solicitado', 'Sin Diagnóstico'))
+        titulo_siniestro = f"C-{num_ticket:03d} — {proc_solicitado[:12]} — {apellido_paciente}"
+        
+        # Formateo seguro de fechas para Notion (evita enviar 'nan')
+        str_f_accidente = str(f_accidente)[:10] if pd.notna(f_accidente) else None
+        str_f_notificacion = str(f_notificacion)[:10] if pd.notna(f_notificacion) else None
+        str_f_cirugia = str(f_cirugia)[:10] if pd.notna(f_cirugia) else None
         
         properties = {
             "Caso": _title(titulo_siniestro),
-            "Paciente": _rich_text(str(data_informe.get("Paciente_Nombre"))),
-            "Edad": _number(int(data_informe.get("Paciente_Edad", 0))),
-            "Procedimiento solicitado": _rich_text(str(data_informe.get("Procedimiento_Solicitado"))),
+            "Paciente": _rich_text(nombre_paciente[:100]),
+            "Edad": _number(edad if edad >= 0 else 0),
+            "Procedimiento solicitado": _rich_text(proc_solicitado[:1000]),
             "Decisión": _status(veredicto["decision"]),
             "Razones (resumen)": _rich_text(veredicto["razones"]),
-            "Fecha de Accidente": _date(str(data_informe.get("Fecha_Accidente"))[:10]),
-            "Fecha de Notificación": _date(str(data_informe.get("Fecha_Admision"))[:10]),
-            "Fecha tentativa de cirugía": _date(str(data_informe.get("Fecha_Admision"))[:10]),
-            "Texto extraído (fallback)": _rich_text(f"Auditoría. Diagnóstico reportado: {data_informe.get('Diagnostico_Clinico')}")
+            "Fecha de Accidente": _date(str_f_accidente),
+            "Fecha de Notificación": _date(str_f_notificacion),
+            "Fecha tentativa de cirugía": _date(str_f_cirugia),
+            "Texto extraído (fallback)": _rich_text(f"Auditoría. Diagnóstico reportado: {data_informe.get('Diagnostico_Clinico', '')}")
         }
         
-        # 1. Buscamos el Data Source ID de la tabla de Siniestros
-        ds_id_casos = await _get_data_source_id(NOTION_CASES_DB_ID)
-        
-        # 2. Creamos la página asignándole el tipo 'data_source_id' como padre
+        # CORRECCIÓN 2: La API de páginas de Notion requiere que el parent sea explícitamente "database_id"
         await notion_retry(lambda: notion.pages.create(
-            parent={"type": "data_source_id", "data_source_id": ds_id_casos}, 
+            parent={"database_id": NOTION_CASES_DB_ID}, 
             properties=properties
         ))
         
         return f"🏁 PROCESO FINALIZADO CON ÉXITO\n\n🔹 Ticket de Siniestro: {titulo_siniestro}\n🔹 Dictamen de Auditoría: {veredicto['decision'].upper()}\n🔹 Justificación Técnica: {veredicto['razones']}"
 
     except Exception as e:
+        # Añadimos un traceback en consola para diagnosticar instantáneamente si hay algún otro fallo de lectura
+        print("🚨 OCURRIÓ UN ERROR EN EL PIPELINE:")
+        traceback.print_exc()
         return f"❌ Error crítico procesando la estructura de los archivos: {str(e)}"
 
 # ==============================================================================
